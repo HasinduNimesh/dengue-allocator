@@ -12,6 +12,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from components import (
+    CAPACITY_COLOURS,
     choropleth,
     estimate_notice,
     facility_map,
@@ -29,7 +30,7 @@ from theme import CATEGORICAL, PAGE, kpi_html
 from dengue import config
 from dengue.platform.hospital import ClinicalRatios
 from dengue.platform.provenance import SOURCE_REGISTRY, ProvenanceTier, unavailable_reason
-from dengue.platform.rbac import Permission, Principal, filter_to_scope
+from dengue.platform.rbac import Permission, Principal, Role, filter_to_scope
 from dengue.platform.risk import (
     RISK_THRESHOLDS,
     RiskLevel,
@@ -111,7 +112,7 @@ def _risk_choropleth(
         categorical=True,
         tooltip_columns=[
             ("q0.5", "Forecast cases", ".0f"),
-            ("incidence_per_100k", "Per 100,000", ".1f"),
+            ("incidence_per_100k", "Per 100,000/week", ".1f"),
         ],
         legend_title="Risk level",
         enable_click=enable_click,
@@ -159,10 +160,7 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
     summary = national_summary(assessments)
 
     st.markdown("## National overview")
-    st.caption(
-        f"All {summary['n_districts']} districts, {horizon} weeks ahead — identical for "
-        "every role, shown before anything role-specific below."
-    )
+    st.caption(f"All {summary['n_districts']} districts, {horizon} weeks ahead")
 
     kpi_grid(
         [
@@ -220,14 +218,10 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
         cols = st.columns(4)
         for col, level in zip(cols, RiskLevel, strict=False):
             col.markdown(risk_pill(level), unsafe_allow_html=True)
-            col.caption(f"Above {int(RISK_THRESHOLDS[level])} per 100,000")
+            col.caption(f"Above {RISK_THRESHOLDS[level]:g} per 100,000 per week")
 
     with rank_col:
         st.markdown("**Every district, ranked**")
-        st.caption(
-            "Shown in full regardless of the map above. Click a bar to jump to it "
-            "in the Public portal's district lookup."
-        )
         ranked = frame.sort_values("incidence_per_100k", ascending=False)
         colours = {level.value: level.colour for level in RiskLevel}
         # This click param only captures the event (on_select="rerun" needs at
@@ -240,7 +234,7 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
             .mark_bar(cornerRadiusEnd=3)
             .encode(
                 y=alt.Y("district:N", sort="-x", title=None),
-                x=alt.X("incidence_per_100k:Q", title="Per 100,000"),
+                x=alt.X("incidence_per_100k:Q", title="Per 100,000/week"),
                 color=alt.Color(
                     "risk_level:N",
                     scale=alt.Scale(domain=list(colours), range=list(colours.values())),
@@ -249,7 +243,7 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
                 opacity=alt.condition("datum.is_selected", alt.value(1.0), alt.value(0.55)),
                 tooltip=[
                     alt.Tooltip("district:N", title="District"),
-                    alt.Tooltip("incidence_per_100k:Q", title="Per 100,000", format=".1f"),
+                    alt.Tooltip("incidence_per_100k:Q", title="Per 100,000/week", format=".1f"),
                     alt.Tooltip("risk_level:N", title="Risk"),
                 ],
             )
@@ -267,6 +261,151 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
             st.session_state["selected_district"] = picked
             st.rerun()
 
+    has_observed_history = (
+        panel is not None and not panel.empty and "population" in panel.columns
+    )
+    predictions_history = data.get("predictions_history")
+    at_horizon = (
+        predictions_history[predictions_history["horizon"] == horizon]
+        if predictions_history is not None and not predictions_history.empty
+        else None
+    )
+    has_predicted_history = at_horizon is not None and not at_horizon.empty
+
+    if has_observed_history:
+        st.markdown("**View a past week**")
+        history = panel.copy()
+        history["incidence_per_100k"] = history["cases"] / history["population"] * 100_000.0
+        history["risk_level"] = history["incidence_per_100k"].apply(
+            lambda v: classify(float(v or 0)).value
+        )
+        weeks = sorted(history["iso_week"].dropna().unique())
+        if weeks:
+            # One slider drives both maps below -- it names a single week,
+            # and each column answers a different question about it ("what
+            # happened" vs. "what the model, looking only at earlier data,
+            # thought would happen"). A second, separately-scrubbed slider
+            # for the prediction made the two maps hard to compare, since
+            # they were then usually showing two different weeks.
+            default_week = weeks[-1]
+            if has_predicted_history:
+                targets = sorted(at_horizon["target_week"].dropna().unique())
+                if targets:
+                    default_week = targets[-1]
+            chosen_week = st.select_slider(
+                "Week",
+                weeks,
+                value=default_week,
+                format_func=lambda w: pd.Timestamp(w).strftime("%d %b %Y"),
+                key="history_week",
+                label_visibility="collapsed",
+            )
+
+            observed_col, predicted_col = st.columns(2)
+
+            with observed_col:
+                st.caption("Observed")
+                week_frame = history[history["iso_week"] == chosen_week]
+                past_chart = choropleth(
+                    week_frame,
+                    value_column="risk_level",
+                    categorical=True,
+                    tooltip_columns=[
+                        ("cases", "Cases", ".0f"),
+                        ("incidence_per_100k", "Per 100,000/week", ".1f"),
+                    ],
+                    legend_title="Risk level",
+                    # Half-width column, next to the predicted map -- the
+                    # default 620px would overflow it.
+                    width=440,
+                    height=380,
+                )
+                if past_chart is None:
+                    st.info("Map geometry unavailable.", icon="🗺️")
+                else:
+                    # A key that varies with the selected week -- otherwise
+                    # Streamlit reuses this element's prior client-side
+                    # state across weeks the same way the current-week map's
+                    # own click selection is deliberately shared (see the
+                    # comment above `remembered`), which here would be the
+                    # opposite of what's wanted: each week's map must stand
+                    # on its own.
+                    st.altair_chart(past_chart, key=f"history_map_{chosen_week}")
+                if not week_frame.empty:
+                    worst = week_frame.sort_values("incidence_per_100k", ascending=False).iloc[0]
+                    kpi_grid(
+                        [
+                            kpi_html(
+                                "Cases that week",
+                                _fmt(week_frame["cases"].sum()),
+                                "Nationwide, observed",
+                            ),
+                            kpi_html(
+                                "Highest risk that week",
+                                DISTRICT_NAMES.get(worst["district_id"], worst["district_id"]),
+                                classify(float(worst["incidence_per_100k"] or 0)).label,
+                            ),
+                        ]
+                    )
+                else:
+                    st.info("No observed data for this week.", icon="🗓️")
+
+            with predicted_col:
+                st.caption(f"Predicted, {horizon}w ahead")
+                # Bounded to a fixed 2026 Jun-Aug window on purpose -- see
+                # dengue.eval.history's module docstring. `chosen_week` here
+                # is the *target* week (what the map shows), not the origin
+                # the model was standing at when it made the call.
+                pred_frame = (
+                    at_horizon[at_horizon["target_week"] == chosen_week].copy()
+                    if has_predicted_history
+                    else pd.DataFrame()
+                )
+                if pred_frame.empty:
+                    st.info("No prediction for this week at the current horizon.", icon="🗓️")
+                else:
+                    pred_frame["risk_level"] = pred_frame["predicted_incidence_per_100k"].apply(
+                        lambda v: classify(float(v or 0)).value
+                    )
+                    pred_chart = choropleth(
+                        pred_frame,
+                        value_column="risk_level",
+                        categorical=True,
+                        tooltip_columns=[
+                            ("predicted_incidence_per_100k", "Predicted per 100,000/week", ".1f"),
+                        ],
+                        legend_title="Predicted risk level",
+                        width=440,
+                        height=380,
+                    )
+                    if pred_chart is None:
+                        st.info("Map geometry unavailable.", icon="🗺️")
+                    else:
+                        st.altair_chart(
+                            pred_chart, key=f"history_pred_map_{chosen_week}_{horizon}"
+                        )
+                    pred_worst = pred_frame.sort_values(
+                        "predicted_incidence_per_100k", ascending=False
+                    ).iloc[0]
+                    kpi_grid(
+                        [
+                            kpi_html(
+                                "Predicted cases",
+                                _fmt(pred_frame["q0.5"].sum()),
+                                "Nationwide, that week",
+                            ),
+                            kpi_html(
+                                "Predicted highest risk",
+                                DISTRICT_NAMES.get(
+                                    pred_worst["district_id"], pred_worst["district_id"]
+                                ),
+                                classify(
+                                    float(pred_worst["predicted_incidence_per_100k"] or 0)
+                                ).label,
+                            ),
+                        ]
+                    )
+
     st.divider()
     trend_col, rain_col = st.columns(2)
     with trend_col:
@@ -282,11 +421,7 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
                 history_and_forecast_chart(national_history, national_forecast),
                 width="stretch",
             )
-            st.caption(
-                "Solid = observed. Dashed = forecast, summed across districts — a "
-                "coarse aggregate for an at-a-glance view, not a jointly-modelled "
-                "national interval."
-            )
+            st.caption("Solid = observed. Dashed = forecast, summed across districts.")
         else:
             st.info("Not enough data for a trend chart yet.", icon="ℹ️")
 
@@ -309,11 +444,6 @@ def national_overview(data: dict[str, pd.DataFrame], horizon: int) -> None:
     if national is not None and not national.empty:
         st.markdown("**Rainfall and cases, overlaid**")
         st.altair_chart(rainfall_cases_overlay(national, height=260), width="stretch")
-        st.caption(
-            "Same two series, one timeline — each normalised to its own 0–100 "
-            "range so the lag is easy to eyeball. Not a magnitude comparison "
-            "between rain and cases; see the stacked panels above for that."
-        )
 
 
 # ==========================================================================
@@ -373,7 +503,7 @@ def public_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon: 
                 )
                 st.caption(
                     f"Likely range {_fmt(a.forecast_lower)}–{_fmt(a.forecast_upper)} cases "
-                    f"(80% interval) · {a.incidence_per_100k:.1f} per 100,000"
+                    f"(80% interval) · {a.incidence_per_100k:.1f} per 100,000 per week"
                 )
             with right:
                 st.markdown("**What you should do**")
@@ -502,13 +632,102 @@ def hospital_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon
     # so recomputing this on every rerun does not violate the app's
     # no-compute-at-request-time rule the way retraining Stage 1 or
     # re-solving Stage 3 would.
-    readiness = build_readiness_table(
+    full_readiness = build_readiness_table(
         district_risk, capacity, horizon_weeks=horizon, ratios=live_ratios
     )
-    readiness = filter_to_scope(readiness, principal)
+    readiness = filter_to_scope(full_readiness, principal)
+    readiness = readiness.merge(
+        capacity[["district_id", "n_facilities", "n_hospitals", "population"]],
+        on="district_id",
+        how="left",
+    )
+    readiness["facilities_per_100k"] = (
+        readiness["n_facilities"] / readiness["population"] * 100_000.0
+    )
 
     st.subheader("Hospital readiness")
     st.caption(f"Scope: {principal.scope_label()} · {horizon} weeks ahead")
+
+    if principal.role is Role.HOSPITAL_STAFF:
+        own_names = {DISTRICT_NAMES.get(d, d) for d in principal.districts}
+        other_names = sorted(n for n in DISTRICT_NAMES.values() if n not in own_names)
+        with st.expander("🔍 Preview another district"):
+            st.caption("Preview only — does not change your account's access.")
+            if other_names:
+                preview_name = st.selectbox(
+                    "District", other_names, key="hospital_preview_district"
+                )
+                name_to_id = {v: k for k, v in DISTRICT_NAMES.items()}
+                preview_id = name_to_id[preview_name]
+                preview_row = full_readiness[full_readiness["district_id"] == preview_id]
+                preview_capacity = capacity[capacity["district_id"] == preview_id]
+
+                if not preview_row.empty:
+                    r = preview_row.iloc[0]
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Forecast cases", _fmt(r["forecast_cases"]))
+                    p2.metric("Admissions", _fmt(r["admissions"]))
+                    p3.metric("ICU patients", _fmt(r["icu_patients"], 1))
+                    p4.metric("Occupancy", f"{r['occupancy_pct']:.0f}%")
+
+                    n_hosp = (
+                        int(preview_capacity["n_hospitals"].iloc[0])
+                        if not preview_capacity.empty
+                        else None
+                    )
+                    n_fac = (
+                        int(preview_capacity["n_facilities"].iloc[0])
+                        if not preview_capacity.empty
+                        else None
+                    )
+                    status_label = str(r["capacity_status"]).replace("_", " ").title()
+                    st.markdown(
+                        f"**Status:** {status_label} &nbsp;·&nbsp; **Hospitals:** "
+                        f"{n_hosp if n_hosp is not None else '—'} &nbsp;·&nbsp; "
+                        f"**Facilities:** {n_fac if n_fac is not None else '—'}"
+                    )
+
+                map_col, facility_col = st.columns(2)
+                with map_col:
+                    highlight_frame = full_readiness.copy()
+                    highlight_frame["is_previewed"] = (
+                        highlight_frame["district_id"] == preview_id
+                    )
+                    preview_chart = choropleth(
+                        highlight_frame,
+                        value_column="capacity_status",
+                        categorical=True,
+                        colour_map=CAPACITY_COLOURS,
+                        domain_order=list(CAPACITY_COLOURS),
+                        highlight_column="is_previewed",
+                        tooltip_columns=[
+                            ("occupancy_pct", "Occupancy %", ".1f"),
+                            ("admissions", "Admissions", ".0f"),
+                        ],
+                        legend_title="Capacity status",
+                        height=320,
+                        width=340,
+                    )
+                    if preview_chart is not None:
+                        # No use_container_width -- geoshape needs a fixed pixel extent.
+                        st.altair_chart(preview_chart)
+                with facility_col:
+                    all_facilities = data.get("health_facilities")
+                    if all_facilities is not None and not all_facilities.empty:
+                        preview_facilities = all_facilities[
+                            all_facilities["district_id"] == preview_id
+                        ]
+                        if not preview_facilities.empty:
+                            preview_fmap = facility_map(
+                                preview_facilities, height=320, width=340
+                            )
+                            if preview_fmap is not None:
+                                st.altair_chart(preview_fmap)
+                            st.caption(f"{len(preview_facilities):,} OSM facilities shown.")
+                        else:
+                            st.caption("No OpenStreetMap facilities recorded for this district.")
+            else:
+                st.caption("Your account already covers every district.")
 
     if ratio_error:
         st.error(
@@ -578,6 +797,8 @@ def hospital_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon
                 "peak_occupied_beds",
                 "occupancy_pct",
                 "capacity_status",
+                "n_hospitals",
+                "facilities_per_100k",
             ]
         ].copy()
         # Pre-formatted as display strings rather than via st.column_config:
@@ -594,6 +815,8 @@ def hospital_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon
         show["paediatric_admissions"] = show["paediatric_admissions"].map("{:.0f}".format)
         show["peak_occupied_beds"] = show["peak_occupied_beds"].map("{:.0f}".format)
         show["occupancy_pct"] = show["occupancy_pct"].map("{:.1f}%".format)
+        show["n_hospitals"] = show["n_hospitals"].map("{:.0f}".format)
+        show["facilities_per_100k"] = show["facilities_per_100k"].map("{:.1f}".format)
         st.dataframe(
             show.rename(
                 columns={
@@ -606,6 +829,8 @@ def hospital_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon
                     "peak_occupied_beds": "Peak beds",
                     "occupancy_pct": "Occupancy %",
                     "capacity_status": "Status",
+                    "n_hospitals": "Hospitals",
+                    "facilities_per_100k": "Facilities/100k",
                 }
             ),
             hide_index=True,
@@ -619,6 +844,12 @@ def hospital_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon
             + (" (your ratios)." if is_customised else " (defaults).")
             + " Occupancy is against district beds estimated from World Bank national "
             "bed density, assuming 15% are available for dengue."
+        )
+        st.caption(
+            "**Hospitals** and **Facilities/100k** are real OpenStreetMap counts "
+            "(ODbL), not estimates — the same figures already used to set Stage 3's "
+            "allocation floor for facility-poor districts, alongside the case-based "
+            "high-risk flag."
         )
 
     with tab_supply:
@@ -751,41 +982,79 @@ def moh_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon: int
     principal.require(Permission.VIEW_DISTRICT_OPERATIONS)
 
     district_risk = data["district_risk"]
-    frame = filter_to_scope(_risk_frame(district_risk, horizon), principal)
     sweep = data.get("allocation_sweep")
     scenarios = data.get("scenarios")
+    capacity = data.get("district_capacity")
+
+    facility_poor: frozenset[str] = frozenset()
+    facilities_by_district: dict[str, int] = {}
+    if capacity is not None and not capacity.empty:
+        from dengue.ingest.health_facilities import facility_poor_districts
+
+        # Same nsmallest-over-25-rows arithmetic pipeline.py runs to set
+        # Stage 3's allocation floor -- recomputing it here to label the
+        # cards is cheap enough not to violate "never compute at request
+        # time" (that rule is about model refits and ILP re-solves).
+        facility_poor = frozenset(facility_poor_districts(capacity))
+        facilities_by_district = dict(zip(capacity["district_id"], capacity["n_facilities"]))
 
     st.subheader("District operations")
     st.caption(f"Scope: {principal.scope_label()} · {horizon} weeks ahead")
 
-    assessments = [
-        a
-        for a in assess_all(district_risk, horizon_weeks=horizon, audience="moh")
-        if principal.may_see_district(a.district_id)
-    ]
+    all_assessments = assess_all(district_risk, horizon_weeks=horizon, audience="moh")
+
+    def _hotspot_card(a) -> None:
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.markdown(risk_pill(a.risk_level), unsafe_allow_html=True)
+                st.markdown(f"**{a.district_name}**")
+                n_fac = facilities_by_district.get(a.district_id)
+                fac_line = f" · {n_fac} facilities" if n_fac is not None else ""
+                st.caption(
+                    f"{_fmt(a.forecast_median)} cases · {a.incidence_per_100k:.1f}/100k · "
+                    f"{a.change_pct:+.0f}%{fac_line}"
+                )
+                if a.district_id in facility_poor:
+                    st.caption("🏥 Facility-poor — qualifies for the allocation floor")
+            with c2:
+                recommendation_list(a.recommendations, limit=3)
 
     tab_ops, tab_teams, tab_plan, tab_scenario, tab_budget = st.tabs(
         ["Hotspots", "Team deployment", "Intervention plan", "Scenarios", "Budget"]
     )
 
     with tab_ops:
-        chart = _risk_choropleth(frame)
+        own_names = sorted(DISTRICT_NAMES.get(d, d) for d in principal.districts)
+        name_to_id = {v: k for k, v in DISTRICT_NAMES.items()}
+        if principal.role is Role.MOH_OFFICER:
+            # Which districts get a Hotspots card is chooseable -- this is a
+            # viewing convenience, not a scope change: Team deployment,
+            # Intervention plan and Budget below still run through
+            # filter_to_scope() against the account's real districts, so
+            # what this account can act on is unaffected by what it looks at
+            # here.
+            chosen_names = st.multiselect(
+                "Districts shown",
+                sorted(DISTRICT_NAMES.values()),
+                default=own_names,
+                key="moh_hotspot_districts",
+            )
+        else:
+            chosen_names = own_names
+        chosen_ids = {name_to_id[n] for n in chosen_names}
+        shown = [a for a in all_assessments if a.district_id in chosen_ids]
+        shown.sort(key=lambda a: a.incidence_per_100k, reverse=True)
+
+        highlight_frame = _risk_frame(district_risk, horizon).copy()
+        highlight_frame["is_shown"] = highlight_frame["district_id"].isin(chosen_ids)
+        chart = _risk_choropleth(highlight_frame, highlight_column="is_shown")
         if chart is not None:
             # No use_container_width -- geoshape needs a fixed pixel extent.
             st.altair_chart(chart)
 
-        for a in assessments[:3]:
-            with st.container(border=True):
-                c1, c2 = st.columns([1, 3])
-                with c1:
-                    st.markdown(risk_pill(a.risk_level), unsafe_allow_html=True)
-                    st.markdown(f"**{a.district_name}**")
-                    st.caption(
-                        f"{_fmt(a.forecast_median)} cases · {a.incidence_per_100k:.1f}/100k · "
-                        f"{a.change_pct:+.0f}%"
-                    )
-                with c2:
-                    recommendation_list(a.recommendations, limit=3)
+        for a in shown:
+            _hotspot_card(a)
 
     with tab_teams:
         if sweep is None or sweep.empty:
@@ -1150,10 +1419,12 @@ def admin_portal(principal: Principal, data: dict[str, pd.DataFrame], horizon: i
                 rows.append(entry)
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.info(
-            "**No authentication backend is connected.** The role switcher in the "
-            "sidebar is a demonstration of the access model, not a login. Production "
-            "deployment needs an identity provider and server-side enforcement — "
-            "client-side role selection is not a security control.",
+            "**Authentication is connected (Supabase).** Accounts are provisioned by "
+            "an administrator, not self-registered, and each account's role and "
+            "district scope is loaded server-side from a `profiles` row (see "
+            "`supabase/schema.sql`) — the viewer cannot choose a role, only sign "
+            "into whichever account they hold. This matrix documents what each role "
+            "is authorized to do once authenticated; it is not the login itself.",
             icon="🔐",
         )
 
