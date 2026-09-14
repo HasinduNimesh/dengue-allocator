@@ -22,10 +22,10 @@ Setup this depends on (see ``supabase/schema.sql``, not run automatically):
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from dengue.platform.rbac import Principal, Role
+from dengue.platform.secrets import get_secret
 from dengue.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -35,28 +35,11 @@ class AuthError(Exception):
     """Sign-in or profile-lookup failure. The message is safe to show a user directly."""
 
 
-def _get_secret(name: str) -> str | None:
-    """Read a config value from Streamlit secrets first, then the environment.
-
-    Importing streamlit lazily (not at module level) keeps this module
-    importable from a plain script -- e.g. a one-off account-seeding script
-    -- without needing a Streamlit runtime.
-    """
-    try:
-        import streamlit as st
-
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except Exception:
-        pass
-    return os.environ.get(name)
-
-
 def _client():
     from supabase import create_client
 
-    url = _get_secret("SUPABASE_URL")
-    key = _get_secret("SUPABASE_ANON_KEY")
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_ANON_KEY")
     if not url or not key:
         raise AuthError(
             "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY in "
@@ -116,6 +99,16 @@ def _load_principal(client, user_id: str, email: str) -> Principal:
             "create one (see supabase/schema.sql) before this account can log in."
         )
     row = rows[0]
+    # `active` defaults true at the database level (see
+    # supabase/account_management.sql) -- .get(..., True) only matters for a
+    # project that hasn't run that migration yet, where the column doesn't
+    # exist in the row at all.
+    if not row.get("active", True):
+        raise AuthError(
+            f"Account {email} has been deactivated. Ask an administrator to "
+            "reactivate it if this is unexpected."
+        )
+
     try:
         role = Role(row["role"])
     except ValueError as exc:

@@ -28,7 +28,8 @@ PIPELINE_WEEKS ?= 320
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-full data panel panel-synthetic baseline baseline-real \
-        pipeline pipeline-real all tune test test-all lint format app clean clean-data check
+        pipeline pipeline-real all tune test test-all lint format app clean clean-data check \
+        export-web web-setup web web-build
 
 help:  ## Show this help
 	@echo "dengue-allocator targets:"
@@ -102,6 +103,9 @@ history:  ## Build the app's predicted-vs-actual historical view (offline)
 history-real:  ## Same, but against data/processed/panel.parquet
 	$(PY) -m dengue.eval.history
 
+alerts:  ## Send this week's due email alerts (needs Supabase + Resend secrets)
+	$(PY) -m dengue.platform.alerts
+
 all: baseline pipeline history  ## Backtest + full pipeline, everything the app needs
 
 tune:  ## GA hyperparameter + ensemble-weight search, offline (~30 min)
@@ -133,6 +137,25 @@ check: lint test  ## Lint and test
 
 app:  ## Launch the Streamlit dashboard (reads cached artifacts only)
 	$(STREAMLIT) run app/streamlit_app.py
+
+# --------------------------------------------------------------------------
+# Web app (Next.js)
+# --------------------------------------------------------------------------
+# The Next front end reads the same artifacts the Streamlit app does, but it
+# cannot read Parquet -- `export-web` is the one bridge, and it must be re-run
+# after any `make pipeline` for the browser to see the new figures.
+
+export-web:  ## Serialise artifacts/*.parquet to web/public/data/*.json
+	$(PY) -m dengue.export_web
+
+web-setup:  ## Install the Next.js dependencies
+	cd web && npm install
+
+web: export-web  ## Launch the Next.js dashboard in dev mode
+	cd web && npm run dev
+
+web-build: export-web  ## Production build of the Next.js dashboard
+	cd web && npm run build
 
 # --------------------------------------------------------------------------
 # Housekeeping
